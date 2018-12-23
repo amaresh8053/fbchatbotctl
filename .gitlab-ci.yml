@@ -1,0 +1,81 @@
+services:
+  - docker:dind
+
+variables:
+  DOCKER_DRIVER: "overlay"
+
+  APP_ENV: "dev2"
+  APP_NAME: "hyper-converse-fbmessage"
+  APP_VERSION: "1.0.0"
+  APP_SPACE: "dev2"
+  APP_API_NAME: "${APP_NAME}-${APP_ENV}"
+  APP_OWNER_CUID: "hcapp"
+  APP_OWNER_EMAIL: "hcapp.app@centurylink.com"
+
+  REG_BASE_URI: "NE1ITCPRHAS62.ne1.savvis.net:4567"
+  REG_GROUP_NAME: "hyperconverse_dev"
+  REG_IMAGE: "${REG_BASE_URI}/${REG_GROUP_NAME}/hyper-converse-fbmessage:${APP_VERSION}" 
+  REG_SECRET: "reg-secret"
+
+  K8S_CLUSTER_URL: "https://kubeodc01-prod.corp.intranet:6443"
+  K8S_NAMESPACE: "hyper-converse-dev"
+
+  TARGET: target/*.jar
+
+stages:
+  - build
+  - push
+  - k8s
+
+maven-build1:
+  image: maven:3-jdk-8
+  stage: build
+  script:
+    - "mvn sonar:sonar -D sonar.host.url=http://vlodphpn001.corp.intranet:9000"
+    - "mvn install"
+    - "mvn package"
+  artifacts: 
+    name: "${CI_BUILD_ID}_${CI_BUILD_STAGE}_${CI_BUILD_REF_NAME}"
+    paths:
+      - "${TARGET}"
+      
+docker-build:
+  image: docker:latest
+  stage: push
+  only:
+    - master
+  script:
+    - docker login -u gitlab-ci-token -p ${REG_TOKEN} ${REG_BASE_URI}
+    - docker build -t ${REG_IMAGE} .
+    - docker push ${REG_IMAGE}
+
+deploy-k8s:
+  #using below image because it contains envsubst
+  image: marcuswelz/gitlabci-docker-git-gcloud 
+  stage: k8s
+  only:
+    - master
+  script:
+      
+      #set kubernetes credentials 
+    - kubectl config set-cluster mine --server=${K8S_CLUSTER_URL} --insecure-skip-tls-verify=true
+    - kubectl config set-credentials mine --token=${K8S_TOKEN}
+    - kubectl config set-context mine --cluster=mine --user=mine --namespace=${K8S_NAMESPACE}
+    - kubectl config use-context mine
+      
+      #kube secret to access docker registry 
+    - kubectl delete secret ${REG_SECRET} -n ${K8S_NAMESPACE} || true
+    - kubectl create secret docker-registry ${REG_SECRET} --docker-server=${REG_BASE_URI} --docker-username=gitlab-ci-token --docker-password=${REG_TOKEN} --docker-email=${APP_OWNER_EMAIL} -n ${K8S_NAMESPACE}
+    
+      #kubernetes won't allow variables in the yaml files so using envsubst workaround so we can use them 
+    - env envsubst < deployment.tmpl > deployment.yaml
+    - env envsubst < service.tmpl > service.yaml
+    - env envsubst < ingress.tmpl > ingress.yaml
+
+      #using delete/create on deployment to force docker deployment with :latest image version
+    - kubectl delete -f deployment.yaml || true
+    - kubectl create -f deployment.yaml
+    - kubectl apply -f service.yaml -f ingress.yaml
+    - kubectl -n ${K8S_NAMESPACE} describe ingress ${APP_API_NAME}
+
+    
